@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Service
+Name=Add to Steam
+Name[zh_CN]=添加到 Steam
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=application/x-desktop;application/x-executable;application/x-pie-executable;application/x-shellscript;text/x-shellscript;application/vnd.appimage;application/x-iso9660-appimage;application/x-ms-dos-executable;application/x-msdownload;application/vnd.microsoft.portable-executable;
+Actions=addToSteam;
+TryExec=steam
+X-KDE-Priority=TopLevel
+
+[Desktop Action addToSteam]
+Exec=add-to-steam --ui %U
+Icon=steam
+Name=Add to Steam
+Name[zh_CN]=添加到 Steam
+Name[zh_TW]=新增至 Steam
+Name[ja]=Steam に追加

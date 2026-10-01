@@ -1,0 +1,384 @@
+#!/bin/sh
+# add-to-steam — 复刻 SteamOS 的「Add to Steam」（Dolphin 右键 / 命令行）
+#
+# 原理：把文件的绝对路径 percent-encode 后交给 Steam 客户端的未公开 URL scheme：
+#     steam://addnonsteamgame/<encoded-absolute-path>
+# 发送之前必须先创建哨兵文件 /tmp/addnonsteamgamefile（Steam 用它确认这是
+# 本地用户主动发起的请求，而不是网页里的 steam:// 链接在偷偷加游戏）。
+#
+# 参考实现：
+#   https://github.com/vicrodh/steamos-add-to-steam
+#   https://github.com/GloriousEggroll/steam-add-nonsteam-game
+#
+# 设计约束：
+#   * POSIX sh；python3 只用于 percent-encode，缺失时用 od 逐字节兜底（两者输出必须一致）。
+#   * 路径一律通过 argv 传给 python3，绝不做字符串插值（避免空格/引号/中文/$ 出错）。
+#   * 不改 Steam 的 shortcuts.vdf（由 Steam 客户端自己写，避免与运行中的客户端抢写）。
+#   * 用户级运行，不以 root 运行。
+
+set -u
+
+PROG=${0##*/}
+SENTINEL=/tmp/addnonsteamgamefile
+SHOW_UI=0
+DRY_RUN=0
+NOTIFY=1
+
+# 诊断日志：默认写到 ~/.cache/add-to-steam/add-to-steam.log
+#   ADD_TO_STEAM_LOG=/path/to/file  自定义位置
+#   ADD_TO_STEAM_LOG=off            关闭（测试用）
+if [ "${ADD_TO_STEAM_LOG:-}" = off ]; then
+    LOG_FILE=''
+elif [ -n "${ADD_TO_STEAM_LOG:-}" ]; then
+    LOG_FILE=$ADD_TO_STEAM_LOG
+else
+    LOG_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/add-to-steam/add-to-steam.log"
+fi
+
+# 允许的 MIME
+EXE_MIMES='application/vnd.microsoft.portable-executable application/x-ms-dos-executable application/x-msdownload'
+DESKTOP_MIMES='application/x-desktop'
+EXEC_MIMES='application/x-executable application/x-pie-executable application/x-shellscript text/x-shellscript application/vnd.appimage application/x-iso9660-appimage'
+ALL_MIMES="$EXE_MIMES $DESKTOP_MIMES $EXEC_MIMES"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+log_event() {
+    [ -n "$LOG_FILE" ] || return 0
+    [ -d "${LOG_FILE%/*}" ] || mkdir -p "${LOG_FILE%/*}" 2>/dev/null || return 0
+    printf '%s\t%s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || return 0
+    if [ "$(wc -c <"$LOG_FILE" 2>/dev/null || echo 0)" -gt 262144 ]; then
+        mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+    fi
+    return 0
+}
+
+
+err() {
+    if [ "$SHOW_UI" = 1 ] && have kdialog; then
+        kdialog --title "添加到 Steam" --error "$1" >/dev/null 2>&1
+    fi
+    printf '%s: %s\n' "$PROG" "$1" >&2
+}
+
+warn() {
+    printf '%s: %s\n' "$PROG" "$1" >&2
+    if [ "$SHOW_UI" = 1 ] && [ "$NOTIFY" = 1 ] && have kdialog; then
+        kdialog --title "添加到 Steam" --passivepopup "$1" 4 >/dev/null 2>&1
+    fi
+}
+
+usage() {
+    cat <<EOF
+用法: $PROG [--ui|-ui] [--dry-run] [--no-notify] <路径>...
+
+把文件作为非 Steam 游戏加入 Steam 库（等价于 SteamOS 的 Add to Steam）。
+支持：Windows 可执行文件(.exe/.dll) / .desktop / AppImage / 原生可执行文件 / shell 脚本。
+
+  --ui, -ui      用 kdialog 弹窗提示错误与结果（Dolphin 服务菜单使用）
+  --dry-run      只打印将要发送的 steam:// URL，不做任何改动
+  --no-notify    配合 --ui 时不弹成功提示
+  -h, --help     显示本帮助
+EOF
+}
+
+# ---------- percent-encode ----------
+
+percent_encode_py() {
+    python3 -c 'import sys, urllib.parse; sys.stdout.write(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+# 纯 POSIX sh 的 percent-encode：unreserved = A-Z a-z 0-9 - . _ ~，其余按字节 %XX（大写）
+percent_encode_sh() {
+    _out=''
+    for _b in $(printf '%s' "$1" | od -An -v -tu1); do
+        if { [ "$_b" -ge 48 ] && [ "$_b" -le 57 ]; } ||
+           { [ "$_b" -ge 65 ] && [ "$_b" -le 90 ]; } ||
+           { [ "$_b" -ge 97 ] && [ "$_b" -le 122 ]; } ||
+           [ "$_b" -eq 45 ] || [ "$_b" -eq 46 ] ||
+           [ "$_b" -eq 95 ] || [ "$_b" -eq 126 ]; then
+            _out="$_out$(printf '%b' "\\$(printf '%03o' "$_b")")"
+        else
+            _out="$_out$(printf '%%%02X' "$_b")"
+        fi
+    done
+    printf '%s' "$_out"
+}
+
+encode_path() {
+    if [ "${ADD_TO_STEAM_FORCE_SH_ENCODER:-0}" = 1 ]; then
+        percent_encode_sh "$1"
+        return 0
+    fi
+    if have python3; then
+        percent_encode_py "$1"
+        return 0
+    fi
+    percent_encode_sh "$1"
+}
+
+# ---------- 路径与类型 ----------
+
+percent_decode_py() {
+    python3 -c 'import sys, urllib.parse; sys.stdout.write(urllib.parse.unquote(sys.argv[1]))' "$1"
+}
+
+# Dolphin/KIO 可能给 %u 传 file:// URL；普通路径里的 % 不动
+normalize_path() {
+    _p=$1
+    case $_p in
+    file://*)
+        _p=${_p#file://}
+        if have python3; then
+            _p=$(percent_decode_py "$_p")
+        fi
+        ;;
+    esac
+    printf '%s' "$_p"
+}
+
+detect_mime() {
+    if have kmimetypefinder; then
+        kmimetypefinder "$1" 2>/dev/null | sed -n 1p
+        return 0
+    fi
+    if have xdg-mime; then
+        xdg-mime query filetype "$1" 2>/dev/null
+        return 0
+    fi
+    printf '\n'
+}
+
+mime_from_ext() {
+    case $1 in
+    *.exe | *.EXE | *.dll | *.DLL) printf 'application/vnd.microsoft.portable-executable\n' ;;
+    *.desktop) printf 'application/x-desktop\n' ;;
+    *.AppImage | *.appimage) printf 'application/vnd.appimage\n' ;;
+    *.sh) printf 'text/x-shellscript\n' ;;
+    *) printf '\n' ;;
+    esac
+}
+
+in_list() { # $1=值 $2=空格分隔列表
+    for _x in $2; do
+        [ "$_x" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# ---------- 哨兵与发送 ----------
+
+make_sentinel() {
+    (umask 077; : >>"$SENTINEL") 2>/dev/null && return 0
+    rm -f "$SENTINEL" 2>/dev/null
+    if (umask 077; : >>"$SENTINEL") 2>/dev/null; then
+        warn "重建了哨兵文件 $SENTINEL"
+        return 0
+    fi
+    if [ -n "${TMPDIR:-}" ]; then
+        SENTINEL="$TMPDIR/addnonsteamgamefile"
+        if (umask 077; : >>"$SENTINEL") 2>/dev/null; then
+            warn "无法写 /tmp/addnonsteamgamefile，已改用 $SENTINEL（Steam 可能因此拒绝添加）"
+            return 0
+        fi
+    fi
+    warn "无法创建哨兵文件 /tmp/addnonsteamgamefile，Steam 可能拒绝添加"
+    return 0
+}
+
+send_url() {
+    _url=$1
+    if have steam; then
+        if have setsid; then
+            setsid steam "$_url" >/dev/null 2>&1 &
+        else
+            steam "$_url" >/dev/null 2>&1 &
+        fi
+        return 0
+    fi
+    if have flatpak && flatpak info com.valvesoftware.Steam >/dev/null 2>&1; then
+        if have setsid; then
+            setsid flatpak run com.valvesoftware.Steam "$_url" >/dev/null 2>&1 &
+        else
+            flatpak run com.valvesoftware.Steam "$_url" >/dev/null 2>&1 &
+        fi
+        return 0
+    fi
+    return 1
+}
+
+# 只提示、不阻止：库里已有同路径条目时给个提醒（python3 + python-vdf 缺失则静默跳过）
+check_duplicate() {
+    have python3 || return 0
+    _dup=$(python3 - "$1" <<'PY' 2>/dev/null
+import glob
+import os
+import sys
+
+try:
+    import vdf
+except Exception:
+    sys.exit(0)
+
+target = os.path.realpath(sys.argv[1])
+home = os.path.expanduser("~")
+roots = [
+    os.path.join(home, ".steam/steam"),
+    os.path.join(home, ".local/share/Steam"),
+    os.path.join(home, ".steam/root"),
+    os.path.join(home, ".var/app/com.valvesoftware.Steam/data/Steam"),
+    os.path.join(home, ".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+]
+seen = set()
+for root in roots:
+    for vf in sorted(glob.glob(os.path.join(root, "userdata/*/config/shortcuts.vdf"))):
+        real = os.path.realpath(vf)
+        if real in seen or not os.path.isfile(real):
+            continue
+        seen.add(real)
+        try:
+            with open(real, "rb") as fh:
+                data = vdf.binary_loads(fh.read())
+        except Exception:
+            continue
+        for entry in (data.get("shortcuts") or {}).values():
+            exe = str(entry.get("Exe", "")).strip('"')
+            if not exe:
+                continue
+            try:
+                same = os.path.realpath(exe) == target
+            except Exception:
+                same = exe == target
+            if same:
+                print(entry.get("AppName", "?"))
+                sys.exit(0)
+PY
+)
+    [ -n "$_dup" ] && warn "Steam 库里可能已有同路径条目：$_dup（仍会继续添加）"
+    return 0
+}
+
+# ---------- 主流程 ----------
+
+process_one() {
+    _path=$(normalize_path "$1")
+    if [ -z "$_path" ]; then
+        err "路径为空"
+        log_event "REJECT reason=empty-arg"
+        return 1
+    fi
+    if [ "$(printf '%s' "$_path" | wc -l)" -ne 0 ]; then
+        err "路径中含换行符，无法处理"
+        log_event "REJECT reason=newline"
+        return 1
+    fi
+    if [ ! -e "$_path" ]; then
+        err "文件不存在: $_path"
+        log_event "REJECT reason=not-found path=$_path"
+        return 1
+    fi
+    _abs=$(readlink -f "$_path" 2>/dev/null) || _abs=$_path
+
+    _mime=$(detect_mime "$_abs")
+    if ! in_list "$_mime" "$ALL_MIMES"; then
+        _ext=$(mime_from_ext "$_abs")
+        if [ -n "$_ext" ]; then
+            _mime=$_ext
+        else
+            err "不支持的文件类型（识别为 ${_mime:-未知}）: $_abs"
+            log_event "REJECT reason=unsupported mime=${_mime:-unknown} path=$_abs"
+            return 1
+        fi
+    fi
+    if in_list "$_mime" "$EXEC_MIMES" && [ ! -x "$_abs" ]; then
+        # 原生程序 / AppImage / 脚本必须有执行位；可以在图形界面下询问后直接补上
+        if [ "$SHOW_UI" = 1 ] && have kdialog &&
+            kdialog --title "添加到 Steam" --yesno "该文件没有可执行权限，Steam 启动时会失败。
+识别类型：$_mime
+
+是否现在执行 chmod +x 并继续添加？" >/dev/null 2>&1; then
+            chmod u+x "$_abs" 2>/dev/null || true
+            log_event "CHMOD u+x mime=$_mime path=$_abs result_x=$([ -x "$_abs" ] && echo yes || echo no)"
+        fi
+        if [ ! -x "$_abs" ]; then
+            err "文件没有可执行权限（识别为 $_mime）: $_abs
+Steam 启动时会失败，请先执行:
+  chmod +x \"$_abs\""
+            log_event "REJECT reason=not-executable mime=$_mime path=$_abs"
+            return 1
+        fi
+    fi
+
+    _url="steam://addnonsteamgame/$(encode_path "$_abs")"
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '%s\n' "$_url"
+        log_event "DRYRUN mime=$_mime path=$_abs"
+        return 0
+    fi
+
+    check_duplicate "$_abs"
+    make_sentinel
+    if ! send_url "$_url"; then
+        err "找不到 Steam（原生与 Flatpak 都没有安装），无法添加"
+        log_event "REJECT reason=no-steam mime=$_mime path=$_abs"
+        return 1
+    fi
+    log_event "ADD mime=$_mime path=$_abs url=$_url"
+    return 0
+}
+
+main() {
+    # 先记一行：这样“从 Dolphin 点了但什么都没发生”时，能区分
+    # 「脚本根本没被启动」和「启动了但被拒绝」
+    log_event "INVOKE argc=$# argv=$* ppid=$PPID"
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --ui | -ui) SHOW_UI=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        --no-notify) NOTIFY=0 ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            err "未知参数: $1"
+            usage >&2
+            exit 2
+            ;;
+        *) break ;;
+        esac
+        shift
+    done
+
+    if [ $# -eq 0 ]; then
+        usage >&2
+        exit 2
+    fi
+    if [ "$(id -u)" = 0 ]; then
+        err "不要以 root 运行（Steam 需要普通用户图形会话）"
+        exit 1
+    fi
+
+    _ok=0
+    _fail=0
+    for _arg in "$@"; do
+        if process_one "$_arg"; then
+            _ok=$((_ok + 1))
+        else
+            _fail=$((_fail + 1))
+        fi
+    done
+
+    if [ "$DRY_RUN" = 0 ] && [ "$_ok" -gt 0 ] && [ "$SHOW_UI" = 1 ] && [ "$NOTIFY" = 1 ] && have kdialog; then
+        kdialog --title "添加到 Steam" --passivepopup "已发送 $_ok 项到 Steam 库" 4 >/dev/null 2>&1
+    fi
+
+    [ "$_fail" -eq 0 ] || exit 1
+    exit 0
+}
+
+main "$@"
